@@ -24,7 +24,7 @@ jobs:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Set up Zig (master)
-        uses: mlugg/setup-zig@v1
+        uses: mlugg/setup-zig@v2
         with:
           version: master
 
