@@ -1,3 +1,7 @@
 .zig-cache/
 zig-out/
 *.o
+
+# Dev-only — not part of the published repo
+/CLAUDE.md
+/.claude/

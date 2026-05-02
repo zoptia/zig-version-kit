@@ -1,0 +1,68 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to (re)release for (e.g. v0.0.1)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build & publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Set up Zig (master)
+        uses: mlugg/setup-zig@v1
+        with:
+          version: master
+
+      - name: Cross-compile zvk for all targets
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p dist
+          targets=(
+            x86_64-linux-musl
+            aarch64-linux-musl
+            x86_64-macos
+            aarch64-macos
+            x86_64-windows-gnu
+            aarch64-windows-gnu
+          )
+          for target in "${targets[@]}"; do
+            ext=""
+            [[ "$target" == *windows* ]] && ext=".exe"
+            out="zig-out-$target"
+            zig build -Doptimize=ReleaseFast -Dtarget="$target" -p "$out"
+            cp "$out/bin/zvk$ext" "dist/zvk-$target$ext"
+          done
+          ls -la dist
+
+      - name: Compute checksums
+        shell: bash
+        run: |
+          cd dist
+          shasum -a 256 zvk-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: |
+            dist/zvk-*
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
+          generate_release_notes: true

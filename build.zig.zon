@@ -1,0 +1,16 @@
+.{
+    .name = .zvk,
+    .version = "0.0.1",
+    .fingerprint = 0x5225234caf45b0b,
+    .minimum_zig_version = "0.17.0-dev.224+c166c49b1",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "install.sh",
+        "install.ps1",
+        "README.md",
+        "LICENSE",
+    },
+}
