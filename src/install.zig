@@ -96,6 +96,67 @@ pub fn sha256Hex(data: []const u8) [64]u8 {
     return std.fmt.bytesToHex(out, .lower);
 }
 
+/// Zig project's official minisign public key, used to sign tarballs at
+/// ziglang.org/download/ and ziglang.org/builds/. Source:
+/// https://ziglang.org/download/
+const zig_minisign_pubkey_b64 = "RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U";
+
+/// Verify a minisign signature against `file_data` using the supplied base64-encoded
+/// public key. Supports both raw Ed25519 (`Ed`) and BLAKE2b-prehashed Ed25519 (`ED`)
+/// — Zig nightly tarballs use the prehashed form.
+///
+/// Only the file signature (line 2) is verified; the global/trusted-comment signature
+/// (line 4) is not checked in this v1 implementation.
+pub fn verifyMinisign(
+    file_data: []const u8,
+    minisig_text: []const u8,
+    pubkey_b64: []const u8,
+) !void {
+    const decoder = std.base64.standard.Decoder;
+    const Ed25519 = std.crypto.sign.Ed25519;
+    const Blake2b512 = std.crypto.hash.blake2.Blake2b512;
+
+    // Parse pubkey: 2-byte algo "Ed" + 8-byte key_id + 32-byte pubkey, base64-encoded.
+    var pk_buf: [42]u8 = undefined;
+    const pk_size = try decoder.calcSizeForSlice(pubkey_b64);
+    if (pk_size != pk_buf.len) return error.InvalidPubkeyLength;
+    try decoder.decode(&pk_buf, pubkey_b64);
+    if (!std.mem.eql(u8, pk_buf[0..2], "Ed")) return error.UnsupportedPubkeyAlgo;
+    const pk_key_id = pk_buf[2..10];
+    const pk_bytes: [32]u8 = pk_buf[10..42].*;
+
+    // Parse minisig text: line 2 is the signature (after stripping leading "untrusted comment:").
+    var lines = std.mem.splitScalar(u8, minisig_text, '\n');
+    _ = lines.next() orelse return error.MalformedMinisig; // untrusted comment
+    const sig_b64 = lines.next() orelse return error.MalformedMinisig;
+
+    var sig_buf: [74]u8 = undefined;
+    const sig_size = try decoder.calcSizeForSlice(sig_b64);
+    if (sig_size != sig_buf.len) return error.InvalidSignatureLength;
+    try decoder.decode(&sig_buf, sig_b64);
+    const sig_algo = sig_buf[0..2];
+    const sig_key_id = sig_buf[2..10];
+    const sig_bytes: [64]u8 = sig_buf[10..74].*;
+
+    if (!std.mem.eql(u8, pk_key_id, sig_key_id)) return error.KeyIdMismatch;
+
+    const pubkey = try Ed25519.PublicKey.fromBytes(pk_bytes);
+    const sig = Ed25519.Signature.fromBytes(sig_bytes);
+
+    if (std.mem.eql(u8, sig_algo, "ED")) {
+        // Prehashed: BLAKE2b-512 of file, then verify Ed25519 over digest.
+        var hasher = Blake2b512.init(.{});
+        hasher.update(file_data);
+        var digest: [64]u8 = undefined;
+        hasher.final(&digest);
+        try sig.verify(&digest, pubkey);
+    } else if (std.mem.eql(u8, sig_algo, "Ed")) {
+        try sig.verify(file_data, pubkey);
+    } else {
+        return error.UnsupportedSignatureAlgo;
+    }
+}
+
 /// mkdir -p the parent directory of `abs_file`.
 fn ensureParentDir(io: Io, abs_file: []const u8) !void {
     if (std.fs.path.dirname(abs_file)) |parent| {
@@ -404,6 +465,117 @@ pub fn runList(arena: std.mem.Allocator, io: Io, env: *std.process.Environ.Map, 
         any = true;
     }
     if (!any) try stdout.print("  (none)\n", .{});
+}
+
+/// Hardcoded zvk version. Must match `version` in build.zig.zon and used by
+/// `zvk version` and `zvk self-update`.
+pub const zvk_version = "0.0.2";
+
+/// Latest-release API URL for self-update.
+const release_api_url = "https://api.github.com/repos/zoptia/zig-version-kit/releases/latest";
+
+fn currentAssetName(arena: std.mem.Allocator) ![]const u8 {
+    const arch: []const u8 = switch (builtin.cpu.arch) {
+        .x86_64 => "x86_64",
+        .aarch64 => "aarch64",
+        else => return error.UnsupportedArch,
+    };
+    return switch (builtin.os.tag) {
+        .linux => std.fmt.allocPrint(arena, "zvk-{s}-linux-musl", .{arch}),
+        .macos => std.fmt.allocPrint(arena, "zvk-{s}-macos", .{arch}),
+        .windows => std.fmt.allocPrint(arena, "zvk-{s}-windows-gnu.exe", .{arch}),
+        else => error.UnsupportedOS,
+    };
+}
+
+/// Download the latest zvk binary from GitHub Releases and atomically replace
+/// `<install_root>/bin/zvk`. Safe to run while zvk is itself running on POSIX
+/// (rename is atomic; the running process keeps its inode reference).
+pub fn runSelfUpdate(
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    io: Io,
+    env: *std.process.Environ.Map,
+    args: []const []const u8,
+    stdout: *Io.Writer,
+) !void {
+    var dry_run = false;
+    var force = false;
+    for (args) |a| {
+        if (std.mem.eql(u8, a, "--dry-run")) dry_run = true;
+        if (std.mem.eql(u8, a, "--force") or std.mem.eql(u8, a, "-f")) force = true;
+    }
+
+    const root = try defaultRoot(arena, env);
+    const bin_dir = try std.fs.path.join(arena, &.{ root, "bin" });
+    const target = try std.fs.path.join(arena, &.{ bin_dir, "zvk" });
+
+    try stdout.print("[zvk] querying {s}\n", .{release_api_url});
+    try stdout.flush();
+
+    const json_text = try downloadToMemory(gpa, io, release_api_url);
+    defer gpa.free(json_text);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena, json_text, .{});
+    defer parsed.deinit();
+
+    const tag_val = parsed.value.object.get("tag_name") orelse return error.NoTagInResponse;
+    const latest = std.mem.trimStart(u8, tag_val.string, "v");
+
+    try stdout.print("[zvk] current: {s}, latest: {s}\n", .{ zvk_version, latest });
+    try stdout.flush();
+
+    if (!force and std.mem.eql(u8, latest, zvk_version)) {
+        try stdout.print("[zvk] already at latest version\n", .{});
+        return;
+    }
+
+    const asset_name = try currentAssetName(arena);
+    const assets_val = parsed.value.object.get("assets") orelse return error.NoAssetsInResponse;
+
+    var dl_url: ?[]const u8 = null;
+    for (assets_val.array.items) |a| {
+        const name_val = a.object.get("name") orelse continue;
+        if (std.mem.eql(u8, name_val.string, asset_name)) {
+            const url_val = a.object.get("browser_download_url") orelse continue;
+            dl_url = try arena.dupe(u8, url_val.string);
+            break;
+        }
+    }
+    const url = dl_url orelse {
+        try stdout.print("[zvk] no asset matching '{s}' in release {s}\n", .{ asset_name, latest });
+        return error.NoMatchingAsset;
+    };
+
+    if (dry_run) {
+        try stdout.print("[zvk] dry-run: would download {s}\n", .{url});
+        try stdout.print("[zvk] dry-run: would atomically replace {s}\n", .{target});
+        return;
+    }
+
+    try stdout.print("[zvk] downloading {s}\n", .{url});
+    try stdout.flush();
+    const data = try downloadToMemory(gpa, io, url);
+    defer gpa.free(data);
+    try stdout.print("[zvk] downloaded {d} bytes\n", .{data.len});
+    try stdout.flush();
+
+    // Atomic replace via createFileAtomic (writes to a tmp neighbor, then renames over).
+    try std.Io.Dir.createDirPath(.cwd(), io, bin_dir);
+    var atomic = try std.Io.Dir.createFileAtomic(.cwd(), io, target, .{
+        .permissions = .executable_file,
+        .make_path = true,
+        .replace = true,
+    });
+    defer atomic.deinit(io);
+
+    var write_buf: [64 * 1024]u8 = undefined;
+    var fw = atomic.file.writer(io, &write_buf);
+    try fw.interface.writeAll(data);
+    try fw.interface.flush();
+    try atomic.replace(io);
+
+    try stdout.print("[zvk] updated {s}: {s} -> {s}\n", .{ target, zvk_version, latest });
 }
 
 /// Copy the currently-running zvk binary into `<root>/bin/zvk` and ensure PATH is set.
@@ -727,6 +899,26 @@ pub fn run(
             return error.ShaMismatch;
         }
         try stdout.print("[zvk] sha256 verified\n", .{});
+
+        // Minisign verification (Ed25519 over BLAKE2b-512 of tarball, against Zig's pubkey).
+        // Opt out via ZVK_NO_MINISIGN=1.
+        if (env.get("ZVK_NO_MINISIGN")) |_| {
+            try stdout.print("[zvk] minisign verification skipped (ZVK_NO_MINISIGN set)\n", .{});
+        } else {
+            const minisig_url = try std.fmt.allocPrint(arena, "{s}.minisig", .{entry.tarball});
+            try stdout.print("[zvk] fetching {s}\n", .{minisig_url});
+            try stdout.flush();
+            const minisig_text = try downloadToMemory(gpa, io, minisig_url);
+            defer gpa.free(minisig_text);
+
+            verifyMinisign(tarball, minisig_text, zig_minisign_pubkey_b64) catch |err| {
+                try stdout.print("[zvk] error: minisign verification failed: {s}\n", .{@errorName(err)});
+                try stdout.flush();
+                return err;
+            };
+            try stdout.print("[zvk] minisign verified\n", .{});
+        }
+
         try stdout.print("[zvk] extracting to {s}\n", .{version_dir});
         try stdout.flush();
         try extractTarXz(gpa, io, tarball, version_dir, 1);

@@ -56,6 +56,7 @@ zvk list                                 List installed versions and channel sta
 zvk which [channel]                      Show active version for a channel
 zvk status [--json]                      Print full state (text or JSON)
 zvk self-install                         Copy zvk to ~/.zoptia/zig/bin/ + setup PATH
+zvk self-update [--dry-run|--force]      Replace zvk with the latest GitHub Release
 zvk version
 zvk help
 ```
@@ -65,13 +66,16 @@ zvk help
 1. Reads <https://ziglang.org/download/index.json> for the latest version,
    tarball URL, and sha256.
 2. Skips work if that version is already installed.
-3. Otherwise downloads, verifies sha256, and extracts to
-   `~/.zoptia/zig/versions/<version>/` — using `std.compress.xz` and `std.tar`
-   from the Zig stdlib (no system `tar`, no `jq`, no `python`).
+3. Otherwise downloads, verifies sha256, fetches `<tarball>.minisig` and
+   verifies the Ed25519 signature against the Zig project's [official public key][zig-key],
+   then extracts to `~/.zoptia/zig/versions/<version>/` — using `std.compress.xz`
+   and `std.tar` from the Zig stdlib (no system `tar`, no `jq`, no `python`).
 4. Maintains channel symlinks (`~/.zoptia/zig/channels/{release,nightly}`) and
    bin symlinks (`~/.zoptia/zig/bin/{zig,zig-nightly}`).
 5. Adds `~/.zoptia/zig/bin` to PATH in your shell rc (`zsh` / `bash` / `fish`)
    idempotently.
+
+[zig-key]: https://ziglang.org/download/
 
 ## Layout
 
@@ -110,6 +114,7 @@ Disable with `ZVK_NO_CLAUDE_MD=1`.
 | `ZVK_ROOT`             | Override install root (default: `~/.zoptia/zig`)            |
 | `ZVK_NO_MODIFY_PATH`   | Skip writing to your shell rc                               |
 | `ZVK_NO_CLAUDE_MD`     | Skip writing `~/.zoptia/zig/CLAUDE.md`                      |
+| `ZVK_NO_MINISIGN`      | Skip Ed25519 signature verification on tarballs (not recommended) |
 | `ZVK_VERSION`          | Pin a `zvk` release tag in `install.sh` / `install.ps1`     |
 
 ## Build from source

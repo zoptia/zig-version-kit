@@ -2,7 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 const install = @import("install.zig");
 
-const version = "0.0.1";
+const version = install.zvk_version;
 
 const usage =
     \\zvk - Zig version kit
@@ -16,6 +16,7 @@ const usage =
     \\  zvk which [channel]                      Show active version for a channel
     \\  zvk status [--json]                      Print full state (text or JSON)
     \\  zvk self-install                         Copy zvk to ~/.zoptia/zig/bin/ + setup PATH
+    \\  zvk self-update [--dry-run|--force]      Replace zvk with the latest GitHub Release
     \\  zvk version                              Print zvk version
     \\  zvk help                                 Show this help
     \\
@@ -74,6 +75,8 @@ pub fn main(init: std.process.Init) !void {
         );
     } else if (eq(cmd, "self-install")) {
         try install.runSelfInstall(init.arena.allocator(), init.gpa, init.io, init.environ_map, stdout);
+    } else if (eq(cmd, "self-update")) {
+        try install.runSelfUpdate(init.arena.allocator(), init.gpa, init.io, init.environ_map, args[2..], stdout);
     } else if (eq(cmd, "status") or eq(cmd, "info")) {
         try install.runStatus(init.arena.allocator(), init.io, init.environ_map, args[2..], stdout);
     } else if (eq(cmd, "version") or eq(cmd, "--version") or eq(cmd, "-v")) {
