@@ -8,21 +8,24 @@ const usage =
     \\zvk - Zig version kit
     \\
     \\Usage:
-    \\  zvk install [release|nightly]            Install Zig (default: release)
-    \\  zvk update  [release|nightly|all]        Re-run install for the given channel(s)
-    \\  zvk use <channel> <version>              Point a channel at an installed version
-    \\  zvk uninstall <version>                  Remove an installed version
-    \\  zvk list                                 List installed versions and channel state
-    \\  zvk which [channel]                      Show active version for a channel
-    \\  zvk status [--json]                      Print full state (text or JSON)
-    \\  zvk self-install                         Copy zvk to ~/.zoptia/zig/bin/ + setup PATH
-    \\  zvk self-update [--dry-run|--force]      Replace zvk with the latest GitHub Release
-    \\  zvk version                              Print zvk version
-    \\  zvk help                                 Show this help
+    \\  zvk install [release|nightly] [--no-zls]  Install Zig (default: release; release auto-installs zls)
+    \\  zvk install zls                           Install/refresh zls matched to active release Zig
+    \\  zvk update  [release|nightly|zls|all]     Re-run install for the given target(s)
+    \\  zvk use <channel> <version>               Point a channel at an installed version
+    \\  zvk uninstall <version>                   Remove an installed version
+    \\  zvk list                                  List installed versions and channel state
+    \\  zvk which [channel]                       Show active version for a channel
+    \\  zvk status [--json]                       Print full state (text or JSON)
+    \\  zvk lsp-config                            Print Claude Code .lsp.json snippet to stdout
+    \\  zvk self-install                          Copy zvk to ~/.zoptia/zig/bin/ + setup PATH
+    \\  zvk self-update [--dry-run|--force]       Replace zvk with the latest GitHub Release
+    \\  zvk version                               Print zvk version
+    \\  zvk help                                  Show this help
     \\
     \\PATH commands installed:
     \\  zig            -> active release       (the conservative default)
     \\  zig-nightly    -> active nightly       (opt-in via `zvk install nightly`)
+    \\  zls            -> release-matched zls  (opt-out via --no-zls or ZVK_NO_ZLS=1)
     \\
 ;
 
@@ -48,14 +51,28 @@ pub fn main(init: std.process.Init) !void {
     const cmd = args[1];
 
     if (eq(cmd, "install")) {
-        try install.run(
-            init.arena.allocator(),
-            init.gpa,
-            init.io,
-            init.environ_map,
-            args[2..],
-            stdout,
-        );
+        // `zvk install zls` is a special target that installs zls only,
+        // matched to the active release Zig.
+        if (args.len >= 3 and eq(args[2], "zls")) {
+            try install.runInstallZls(
+                init.arena.allocator(),
+                init.gpa,
+                init.io,
+                init.environ_map,
+                stdout,
+            );
+        } else {
+            try install.run(
+                init.arena.allocator(),
+                init.gpa,
+                init.io,
+                init.environ_map,
+                args[2..],
+                stdout,
+            );
+        }
+    } else if (eq(cmd, "lsp-config")) {
+        try install.runLspConfig(stdout);
     } else if (eq(cmd, "list") or eq(cmd, "ls")) {
         try install.runList(init.arena.allocator(), init.io, init.environ_map, stdout);
     } else if (eq(cmd, "which")) {
