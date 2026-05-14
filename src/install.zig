@@ -782,9 +782,20 @@ fn binNameForLabel(channel_name: []const u8) []const u8 {
     return channel_name;
 }
 
-/// Read the channel symlink and return the active version (the basename of its target),
-/// or null if the channel is not set. Result is owned by `arena`.
+/// Return the version currently active for `channel`, or null if the channel
+/// is not set. On POSIX the channel is stored as a directory symlink; on
+/// Windows it's a `<channel>.txt` text file (avoids needing the symlink
+/// privilege so non-admin users can install). Result is owned by `arena`.
 pub fn readActiveVersion(arena: std.mem.Allocator, io: Io, root: []const u8, channel: Channel) !?[]const u8 {
+    if (builtin.os.tag == .windows) {
+        const name = try std.fmt.allocPrint(arena, "{s}.txt", .{@tagName(channel)});
+        const path = try std.fs.path.join(arena, &.{ root, "channels", name });
+        const data = std.Io.Dir.readFileAlloc(.cwd(), io, path, arena, .limited(1 << 10)) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        return std.mem.trim(u8, data, " \r\n\t");
+    }
     const link_path = try std.fs.path.join(arena, &.{ root, "channels", @tagName(channel) });
     var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const n = std.Io.Dir.readLinkAbsolute(io, link_path, &buf) catch |err| switch (err) {
@@ -793,6 +804,44 @@ pub fn readActiveVersion(arena: std.mem.Allocator, io: Io, root: []const u8, cha
     };
     const target = buf[0..n];
     return try arena.dupe(u8, std.fs.path.basename(target));
+}
+
+/// Record `version` as the active version for `channel`. POSIX: directory
+/// symlink. Windows: write `<channel>.txt`. Caller must ensure the
+/// corresponding `versions/<version>/` directory already exists.
+fn setActiveVersion(arena: std.mem.Allocator, io: Io, root: []const u8, channel: Channel, version: []const u8) !void {
+    const channels_dir = try std.fs.path.join(arena, &.{ root, "channels" });
+    try std.Io.Dir.createDirPath(.cwd(), io, channels_dir);
+
+    if (builtin.os.tag == .windows) {
+        const name = try std.fmt.allocPrint(arena, "{s}.txt", .{@tagName(channel)});
+        const path = try std.fs.path.join(arena, &.{ channels_dir, name });
+        try std.Io.Dir.writeFile(.cwd(), io, .{ .sub_path = path, .data = version });
+        return;
+    }
+    const link = try std.fs.path.join(arena, &.{ channels_dir, @tagName(channel) });
+    const target = try std.fs.path.join(arena, &.{ "..", "versions", version });
+    try replaceSymlink(io, target, link, true);
+}
+
+/// Place `bin/<binname>` so users can invoke `zig` / `zig-nightly`. POSIX
+/// uses a file symlink through the channel; Windows copies the actual exe
+/// from `versions/<active>/`.
+fn installBinForChannel(arena: std.mem.Allocator, io: Io, root: []const u8, channel: Channel) !void {
+    const bin_dir = try std.fs.path.join(arena, &.{ root, "bin" });
+    try std.Io.Dir.createDirPath(.cwd(), io, bin_dir);
+    const bin_name = binNameFor(channel);
+    const bin_path = try std.fs.path.join(arena, &.{ bin_dir, bin_name });
+
+    if (builtin.os.tag == .windows) {
+        const active = (try readActiveVersion(arena, io, root, channel)) orelse return error.ChannelNotSet;
+        const src = try std.fs.path.join(arena, &.{ root, "versions", active, zigBinaryName() });
+        std.Io.Dir.deleteFile(.cwd(), io, bin_path) catch {};
+        try std.Io.Dir.copyFileAbsolute(src, bin_path, io, .{});
+        return;
+    }
+    const target = try std.fs.path.join(arena, &.{ "..", "channels", @tagName(channel), zigBinaryName() });
+    try replaceSymlink(io, target, bin_path, false);
 }
 
 pub fn runList(arena: std.mem.Allocator, io: Io, env: *std.process.Environ.Map, stdout: *Io.Writer) !void {
@@ -831,7 +880,7 @@ pub fn runList(arena: std.mem.Allocator, io: Io, env: *std.process.Environ.Map, 
 
 /// Hardcoded zvk version. Must match `version` in build.zig.zon and used by
 /// `zvk version` and `zvk self-update`.
-pub const zvk_version = "0.0.5";
+pub const zvk_version = "0.0.6";
 
 /// Latest-release API URL for self-update.
 const release_api_url = "https://api.github.com/repos/zoptia/zig-version-kit/releases/latest";
@@ -990,10 +1039,8 @@ pub fn runUse(arena: std.mem.Allocator, io: Io, env: *std.process.Environ.Map, a
         std.process.exit(1);
     }
 
-    const channel_link = try std.fs.path.join(arena, &.{ root, "channels", @tagName(channel) });
-    const target = try std.fs.path.join(arena, &.{ "..", "versions", version });
-    try std.Io.Dir.createDirPath(.cwd(), io, try std.fs.path.join(arena, &.{ root, "channels" }));
-    try replaceSymlink(io, target, channel_link, true);
+    try setActiveVersion(arena, io, root, channel, version);
+    try installBinForChannel(arena, io, root, channel);
     try writeStatusClaudeMd(arena, io, env);
 
     try stdout.print("channel '{s}' -> {s}\n", .{ @tagName(channel), version });
@@ -1318,22 +1365,15 @@ pub fn run(
         try extractArchive(gpa, io, tarball, version_dir, 1, entry.tarball);
     }
 
-    // Channel symlink: <root>/channels/<channel> -> ../versions/<version>
-    const channels_dir = try std.fs.path.join(arena, &.{ root, "channels" });
-    try std.Io.Dir.createDirPath(.cwd(), io, channels_dir);
-    const channel_link = try std.fs.path.join(arena, &.{ channels_dir, @tagName(channel) });
-    const channel_target = try std.fs.path.join(arena, &.{ "..", "versions", entry.version });
-    try replaceSymlink(io, channel_target, channel_link, true);
+    // Record channel -> version. POSIX symlinks, Windows .txt file.
+    try setActiveVersion(arena, io, root, channel, entry.version);
     try stdout.print("[zvk] channel '{s}' -> {s}\n", .{ @tagName(channel), entry.version });
 
-    // Bin symlink: <root>/bin/{zig|zig-nightly}[.exe] -> ../channels/<channel>/zig[.exe]
+    // Place bin/{zig|zig-nightly}[.exe]. POSIX symlinks through channel,
+    // Windows copies the exe directly from versions/<active>/.
+    try installBinForChannel(arena, io, root, channel);
     const bin_dir = try std.fs.path.join(arena, &.{ root, "bin" });
-    try std.Io.Dir.createDirPath(.cwd(), io, bin_dir);
-    const bin_name = binNameFor(channel);
-    const bin_link = try std.fs.path.join(arena, &.{ bin_dir, bin_name });
-    const bin_target = try std.fs.path.join(arena, &.{ "..", "channels", @tagName(channel), zigBinaryName() });
-    try replaceSymlink(io, bin_target, bin_link, false);
-    try stdout.print("[zvk] {s}/{s} ready\n", .{ bin_dir, bin_name });
+    try stdout.print("[zvk] {s}/{s} ready\n", .{ bin_dir, binNameFor(channel) });
 
     try setupPath(arena, gpa, io, env, bin_dir, stdout);
 
@@ -1527,10 +1567,17 @@ fn linkZlsBin(
     const bin_dir = try std.fs.path.join(arena, &.{ root, "bin" });
     try std.Io.Dir.createDirPath(.cwd(), io, bin_dir);
     const bin = zlsBinaryName();
-    const link = try std.fs.path.join(arena, &.{ bin_dir, bin });
-    const target = try std.fs.path.join(arena, &.{ "..", "zls", zls_version, bin });
-    try replaceSymlink(io, target, link, false);
-    try stdout.print("[zvk] zls {s} ready ({s})\n", .{ zls_version, link });
+    const dst = try std.fs.path.join(arena, &.{ bin_dir, bin });
+
+    if (builtin.os.tag == .windows) {
+        const src = try std.fs.path.join(arena, &.{ root, "zls", zls_version, bin });
+        std.Io.Dir.deleteFile(.cwd(), io, dst) catch {};
+        try std.Io.Dir.copyFileAbsolute(src, dst, io, .{});
+    } else {
+        const target = try std.fs.path.join(arena, &.{ "..", "zls", zls_version, bin });
+        try replaceSymlink(io, target, dst, false);
+    }
+    try stdout.print("[zvk] zls {s} ready ({s})\n", .{ zls_version, dst });
 }
 
 /// zls tarball/zip is flat (binary at the root), so strip_components=0.

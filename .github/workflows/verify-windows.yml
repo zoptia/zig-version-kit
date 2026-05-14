@@ -61,3 +61,36 @@ jobs:
             if (-not (Test-Path $p)) { throw "missing: $p" }
             Write-Host "ok: $p"
           }
+
+      # Asserts that the Windows install used the no-symlink layout (copy +
+      # state file). If any of bin/zig.exe / bin/zls.exe ever come back as a
+      # reparse point, or channels/release.txt is missing, we've regressed
+      # back to a symlink-dependent path that breaks for non-admin users.
+      - name: Confirm Windows uses non-symlink layout
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:USERPROFILE '.zoptia\zig'
+
+          $reparseFlag = [System.IO.FileAttributes]::ReparsePoint
+          foreach ($bin in @('bin\zig.exe', 'bin\zls.exe')) {
+            $p = Join-Path $root $bin
+            if (-not (Test-Path $p)) { throw "missing: $p" }
+            $item = Get-Item $p
+            if (($item.Attributes -band $reparseFlag) -ne 0) {
+              throw "$bin is a reparse point (symlink/junction); expected a plain file copy"
+            }
+            Write-Host "ok: $bin is a plain file copy"
+          }
+
+          $stateFile = Join-Path $root 'channels\release.txt'
+          if (-not (Test-Path $stateFile)) { throw "missing state file: $stateFile" }
+          $version = (Get-Content $stateFile -Raw).Trim()
+          Write-Host "ok: channels/release.txt = $version"
+
+          $oldDir = Join-Path $root 'channels\release'
+          if (Test-Path $oldDir) {
+            $item = Get-Item $oldDir
+            throw "unexpected: channels\release exists (Attributes=$($item.Attributes)); Windows should use channels\release.txt only"
+          }
+          Write-Host "ok: no channels\release directory (state file only)"
