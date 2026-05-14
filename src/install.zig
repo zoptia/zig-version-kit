@@ -17,12 +17,22 @@ pub const Channel = enum {
 
 /// PATH-exposed command name for each channel. `release` is the conservative default
 /// and gets the unqualified `zig`; `nightly` is opt-in via `zig-nightly`.
+/// Filename of the user-visible `zig` / `zig-nightly` command in `bin/`.
+/// On Windows it's a `.cmd` wrapper (not the real .exe) so that the
+/// underlying Zig binary launches via its real `versions/<ver>/zig.exe`
+/// path and can locate its adjacent `lib/` directory.
 pub fn binNameFor(channel: Channel) []const u8 {
     const windows = builtin.os.tag == .windows;
     return switch (channel) {
-        .release => if (windows) "zig.exe" else "zig",
-        .nightly => if (windows) "zig-nightly.exe" else "zig-nightly",
+        .release => if (windows) "zig.cmd" else "zig",
+        .nightly => if (windows) "zig-nightly.cmd" else "zig-nightly",
     };
+}
+
+/// Filename of the user-visible `zls` command in `bin/`. On Windows it's
+/// a `.cmd` wrapper (same reason as `binNameFor`).
+inline fn zlsBinCmdName() []const u8 {
+    return if (builtin.os.tag == .windows) "zls.cmd" else "zls";
 }
 
 /// Basename of the actual zig executable inside a version dir.
@@ -825,8 +835,10 @@ fn setActiveVersion(arena: std.mem.Allocator, io: Io, root: []const u8, channel:
 }
 
 /// Place `bin/<binname>` so users can invoke `zig` / `zig-nightly`. POSIX
-/// uses a file symlink through the channel; Windows copies the actual exe
-/// from `versions/<active>/`.
+/// uses a file symlink through the channel. Windows writes a `.cmd`
+/// wrapper that exec's `versions/<active>/zig.exe` directly — Zig isn't
+/// self-contained and looks for an adjacent `lib/` via `GetModuleFileName`,
+/// so the user-visible command must dispatch through the real .exe path.
 fn installBinForChannel(arena: std.mem.Allocator, io: Io, root: []const u8, channel: Channel) !void {
     const bin_dir = try std.fs.path.join(arena, &.{ root, "bin" });
     try std.Io.Dir.createDirPath(.cwd(), io, bin_dir);
@@ -835,9 +847,14 @@ fn installBinForChannel(arena: std.mem.Allocator, io: Io, root: []const u8, chan
 
     if (builtin.os.tag == .windows) {
         const active = (try readActiveVersion(arena, io, root, channel)) orelse return error.ChannelNotSet;
-        const src = try std.fs.path.join(arena, &.{ root, "versions", active, zigBinaryName() });
+        const exe_path = try std.fs.path.join(arena, &.{ root, "versions", active, zigBinaryName() });
+        const wrapper = try std.fmt.allocPrint(arena, "@\"{s}\" %*\r\n", .{exe_path});
         std.Io.Dir.deleteFile(.cwd(), io, bin_path) catch {};
-        try std.Io.Dir.copyFileAbsolute(src, bin_path, io, .{});
+        // Clean up the v0.0.5/0.0.6 layout (a real .exe lived in bin/).
+        const legacy_exe = if (channel == .release) "zig.exe" else "zig-nightly.exe";
+        const legacy = try std.fs.path.join(arena, &.{ bin_dir, legacy_exe });
+        std.Io.Dir.deleteFile(.cwd(), io, legacy) catch {};
+        try std.Io.Dir.writeFile(.cwd(), io, .{ .sub_path = bin_path, .data = wrapper });
         return;
     }
     const target = try std.fs.path.join(arena, &.{ "..", "channels", @tagName(channel), zigBinaryName() });
@@ -880,7 +897,7 @@ pub fn runList(arena: std.mem.Allocator, io: Io, env: *std.process.Environ.Map, 
 
 /// Hardcoded zvk version. Must match `version` in build.zig.zon and used by
 /// `zvk version` and `zvk self-update`.
-pub const zvk_version = "0.0.6";
+pub const zvk_version = "0.0.7";
 
 /// Latest-release API URL for self-update.
 const release_api_url = "https://api.github.com/repos/zoptia/zig-version-kit/releases/latest";
@@ -1566,15 +1583,18 @@ fn linkZlsBin(
 ) !void {
     const bin_dir = try std.fs.path.join(arena, &.{ root, "bin" });
     try std.Io.Dir.createDirPath(.cwd(), io, bin_dir);
-    const bin = zlsBinaryName();
-    const dst = try std.fs.path.join(arena, &.{ bin_dir, bin });
+    const dst = try std.fs.path.join(arena, &.{ bin_dir, zlsBinCmdName() });
 
     if (builtin.os.tag == .windows) {
-        const src = try std.fs.path.join(arena, &.{ root, "zls", zls_version, bin });
+        const exe_path = try std.fs.path.join(arena, &.{ root, "zls", zls_version, zlsBinaryName() });
+        const wrapper = try std.fmt.allocPrint(arena, "@\"{s}\" %*\r\n", .{exe_path});
         std.Io.Dir.deleteFile(.cwd(), io, dst) catch {};
-        try std.Io.Dir.copyFileAbsolute(src, dst, io, .{});
+        // Clean up the v0.0.5/0.0.6 layout where bin/zls.exe was a real file copy.
+        const legacy = try std.fs.path.join(arena, &.{ bin_dir, "zls.exe" });
+        std.Io.Dir.deleteFile(.cwd(), io, legacy) catch {};
+        try std.Io.Dir.writeFile(.cwd(), io, .{ .sub_path = dst, .data = wrapper });
     } else {
-        const target = try std.fs.path.join(arena, &.{ "..", "zls", zls_version, bin });
+        const target = try std.fs.path.join(arena, &.{ "..", "zls", zls_version, zlsBinaryName() });
         try replaceSymlink(io, target, dst, false);
     }
     try stdout.print("[zvk] zls {s} ready ({s})\n", .{ zls_version, dst });

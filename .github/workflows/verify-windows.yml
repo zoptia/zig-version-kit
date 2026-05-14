@@ -37,14 +37,35 @@ jobs:
           & zvk status
           if ($LASTEXITCODE -ne 0) { throw "zvk status failed ($LASTEXITCODE)" }
 
-      - name: zig version
+      # `zig version` only prints the embedded version string — it doesn't
+      # resolve lib_dir. `zig env` does, and is what catches the v0.0.6 bug
+      # where bin/zig.exe was a plain copy with no adjacent lib/ (Zig fails
+      # with "unable to find zig installation directory"). Also try a real
+      # compile so anything that uses stdlib gets exercised.
+      - name: zig version + env + compile a hello world
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $bin = Join-Path $env:USERPROFILE '.zoptia\zig\bin'
           $env:PATH = "$bin;$env:PATH"
+
           & zig version
           if ($LASTEXITCODE -ne 0) { throw "zig version failed ($LASTEXITCODE)" }
+
+          & zig env
+          if ($LASTEXITCODE -ne 0) { throw "zig env failed ($LASTEXITCODE) — installation directory likely unresolved" }
+
+          $tmp = Join-Path $env:RUNNER_TEMP "zig-smoke"
+          New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+          $src = Join-Path $tmp "hello.zig"
+          'const std = @import("std"); pub fn main() void { std.debug.print("ok\n", .{}); }' | Out-File -Encoding utf8 $src
+          Push-Location $tmp
+          try {
+            & zig build-exe $src
+            if ($LASTEXITCODE -ne 0) { throw "zig build-exe failed ($LASTEXITCODE)" }
+            & .\hello.exe
+            if ($LASTEXITCODE -ne 0) { throw "hello.exe failed ($LASTEXITCODE)" }
+          } finally { Pop-Location }
 
       - name: Confirm expected files
         shell: pwsh
@@ -62,26 +83,40 @@ jobs:
             Write-Host "ok: $p"
           }
 
-      # Asserts that the Windows install used the no-symlink layout (copy +
-      # state file). If any of bin/zig.exe / bin/zls.exe ever come back as a
-      # reparse point, or channels/release.txt is missing, we've regressed
-      # back to a symlink-dependent path that breaks for non-admin users.
-      - name: Confirm Windows uses non-symlink layout
+      # Asserts the Windows install used the .cmd shim layout (state file +
+      # cmd wrapper). Catches regressions:
+      #   - back to symlink/junction (would be a reparse point — breaks for
+      #     non-admin users without Developer Mode)
+      #   - back to a raw .exe copy in bin/ (would re-introduce the
+      #     "unable to find zig installation directory" runtime bug)
+      - name: Confirm Windows uses cmd-shim layout
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $root = Join-Path $env:USERPROFILE '.zoptia\zig'
 
           $reparseFlag = [System.IO.FileAttributes]::ReparsePoint
-          foreach ($bin in @('bin\zig.exe', 'bin\zls.exe')) {
+          foreach ($bin in @('bin\zig.cmd', 'bin\zls.cmd')) {
             $p = Join-Path $root $bin
             if (-not (Test-Path $p)) { throw "missing: $p" }
             $item = Get-Item $p
             if (($item.Attributes -band $reparseFlag) -ne 0) {
-              throw "$bin is a reparse point (symlink/junction); expected a plain file copy"
+              throw "$bin is a reparse point (symlink/junction); expected a plain .cmd file"
             }
-            Write-Host "ok: $bin is a plain file copy"
+            # The wrapper should reference the real .exe under versions/ or zls/.
+            $content = Get-Content $p -Raw
+            if ($content -notmatch '\.exe') {
+              throw "$bin doesn't look like a .cmd wrapper: $content"
+            }
+            Write-Host "ok: $bin is a .cmd wrapper"
           }
+
+          # Make sure the legacy v0.0.5/0.0.6 file copies are gone.
+          foreach ($legacy in @('bin\zig.exe', 'bin\zls.exe')) {
+            $p = Join-Path $root $legacy
+            if (Test-Path $p) { throw "stale: $p should be removed when upgrading to cmd-shim layout" }
+          }
+          Write-Host "ok: no legacy bin\*.exe leftovers"
 
           $stateFile = Join-Path $root 'channels\release.txt'
           if (-not (Test-Path $stateFile)) { throw "missing state file: $stateFile" }

@@ -1,6 +1,6 @@
 .{
     .name = .zvk,
-    .version = "0.0.6",
+    .version = "0.0.7",
     .fingerprint = 0x5225234caf45b0b,
     .minimum_zig_version = "0.17.0-dev.224+c166c49b1",
     .dependencies = .{},
