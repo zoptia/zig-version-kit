@@ -18,10 +18,21 @@ pub const Channel = enum {
 /// PATH-exposed command name for each channel. `release` is the conservative default
 /// and gets the unqualified `zig`; `nightly` is opt-in via `zig-nightly`.
 pub fn binNameFor(channel: Channel) []const u8 {
+    const windows = builtin.os.tag == .windows;
     return switch (channel) {
-        .release => "zig",
-        .nightly => "zig-nightly",
+        .release => if (windows) "zig.exe" else "zig",
+        .nightly => if (windows) "zig-nightly.exe" else "zig-nightly",
     };
+}
+
+/// Basename of the actual zig executable inside a version dir.
+inline fn zigBinaryName() []const u8 {
+    return if (builtin.os.tag == .windows) "zig.exe" else "zig";
+}
+
+/// Basename of the actual zls executable inside a zls version dir.
+inline fn zlsBinaryName() []const u8 {
+    return if (builtin.os.tag == .windows) "zls.exe" else "zls";
 }
 
 /// Default channel when the user runs commands without specifying one.
@@ -179,10 +190,12 @@ pub fn writeFileAbs(io: Io, abs_path: []const u8, data: []const u8) !void {
     });
 }
 
-/// Returns true if `<dir>/zig` exists (treats the directory as a complete install).
+/// Returns true if the zig executable exists inside `version_dir_abs`
+/// (treats the directory as a complete install). On Windows the binary is
+/// `zig.exe`; elsewhere it's `zig`.
 fn isInstalled(io: Io, version_dir_abs: []const u8) bool {
     var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const zig_path = std.fmt.bufPrint(&buf, "{s}/zig", .{version_dir_abs}) catch return false;
+    const zig_path = std.fmt.bufPrint(&buf, "{s}{c}{s}", .{ version_dir_abs, std.fs.path.sep, zigBinaryName() }) catch return false;
     std.Io.Dir.accessAbsolute(io, zig_path, .{}) catch return false;
     return true;
 }
@@ -208,14 +221,116 @@ fn extractTarXz(
     try std.tar.extract(io, dir, &decomp.reader, .{ .strip_components = strip_components });
 }
 
+/// Extract a zip archive from memory into `dest_dir_abs`, emulating
+/// tar's `strip_components`. For Zig's Windows zip the archive contains
+/// a single top-level directory like `zig-x86_64-windows-0.16.0/` — we
+/// extract to a sibling staging dir and rename the inner dir into place.
+///
+/// `std.zip.extract` requires a `*File.Reader` (zip needs seeks), so we
+/// must materialize the bytes on disk first.
+fn extractZipBytes(
+    gpa: std.mem.Allocator,
+    io: Io,
+    zip_bytes: []const u8,
+    dest_dir_abs: []const u8,
+    strip_components: u32,
+) !void {
+    const dest_parent = std.fs.path.dirname(dest_dir_abs) orelse return error.InvalidDest;
+    try std.Io.Dir.createDirPath(.cwd(), io, dest_parent);
+
+    // Stage in a sibling dir so a partial failure can't pollute dest_dir_abs.
+    const dest_base = std.fs.path.basename(dest_dir_abs);
+    const staging = try std.fmt.allocPrint(gpa, "{s}{c}.zvk-staging-{s}", .{ dest_parent, std.fs.path.sep, dest_base });
+    defer gpa.free(staging);
+    std.Io.Dir.deleteTree(.cwd(), io, staging) catch {};
+    try std.Io.Dir.createDirPath(.cwd(), io, staging);
+    defer std.Io.Dir.deleteTree(.cwd(), io, staging) catch {};
+
+    // std.zip wants a File.Reader; write bytes to a temp file inside staging.
+    const tmp_zip = try std.fmt.allocPrint(gpa, "{s}{c}archive.zip", .{ staging, std.fs.path.sep });
+    defer gpa.free(tmp_zip);
+    try std.Io.Dir.writeFile(.cwd(), io, .{ .sub_path = tmp_zip, .data = zip_bytes });
+
+    {
+        var file = try std.Io.Dir.openFileAbsolute(io, tmp_zip, .{});
+        defer file.close(io);
+        const read_buf = try gpa.alloc(u8, 64 * 1024);
+        defer gpa.free(read_buf);
+        var fr = file.reader(io, read_buf);
+
+        // Extract everything into staging. For strip=0 this IS the final layout;
+        // for strip>0 we'll unwrap the inner directories afterwards.
+        var staging_dir = try std.Io.Dir.openDirAbsolute(io, staging, .{});
+        defer staging_dir.close(io);
+        try std.zip.extract(staging_dir, &fr, .{ .allow_backslashes = true });
+    }
+
+    // Remove the temp zip so it doesn't get renamed along with real contents.
+    std.Io.Dir.deleteFile(.cwd(), io, tmp_zip) catch {};
+
+    // Walk `strip_components` directory levels in, expecting exactly one dir at each.
+    var current = try gpa.dupe(u8, staging);
+    defer gpa.free(current);
+    var levels: u32 = strip_components;
+    while (levels > 0) : (levels -= 1) {
+        var d = try std.Io.Dir.openDirAbsolute(io, current, .{ .iterate = true });
+        defer d.close(io);
+        var iter = d.iterate();
+        var found: ?[]u8 = null;
+        defer if (found) |f| gpa.free(f);
+        while (try iter.next(io)) |entry| {
+            if (entry.kind != .directory) continue;
+            if (found != null) return error.UnexpectedMultipleTopLevelEntries;
+            found = try gpa.dupe(u8, entry.name);
+        }
+        const inner_name = found orelse return error.NoTopLevelDir;
+        const next = try std.fs.path.join(gpa, &.{ current, inner_name });
+        gpa.free(current);
+        current = next;
+    }
+
+    // Ensure dest doesn't already exist (rename fails on Windows otherwise).
+    std.Io.Dir.deleteTree(.cwd(), io, dest_dir_abs) catch {};
+    try std.Io.Dir.renameAbsolute(current, dest_dir_abs, io);
+}
+
+/// Dispatcher: picks the right extractor based on the archive's URL extension.
+/// `source_url` is used only for format detection; the bytes come from `archive`.
+fn extractArchive(
+    gpa: std.mem.Allocator,
+    io: Io,
+    archive: []const u8,
+    dest_dir_abs: []const u8,
+    strip_components: u32,
+    source_url: []const u8,
+) !void {
+    if (std.mem.endsWith(u8, source_url, ".zip")) {
+        try extractZipBytes(gpa, io, archive, dest_dir_abs, strip_components);
+        return;
+    }
+    try extractTarXz(gpa, io, archive, dest_dir_abs, strip_components);
+}
+
 /// Idempotent symlink: deletes existing link at `link_abs` if any, then creates one pointing to `target`.
 /// `target` is taken verbatim — usually a path relative to `link_abs`'s directory.
-fn replaceSymlink(io: Io, target: []const u8, link_abs: []const u8) !void {
+///
+/// `is_directory` is consulted on Windows to pick the correct symlink type
+/// (file vs directory). On POSIX it is ignored — the kernel infers from the
+/// target. GitHub Actions Windows runners and Windows users with Developer
+/// Mode (or admin) can create symlinks; otherwise this will fail with
+/// AccessDenied / PermissionDenied.
+fn replaceSymlink(io: Io, target: []const u8, link_abs: []const u8, is_directory: bool) !void {
+    // On Windows, a directory symlink can only be removed by deleteDir; on
+    // POSIX, deleteFile works for both. Try both to stay simple.
     std.Io.Dir.deleteFile(.cwd(), io, link_abs) catch |err| switch (err) {
         error.FileNotFound => {},
+        error.IsDir => std.Io.Dir.deleteDir(.cwd(), io, link_abs) catch |e| switch (e) {
+            error.FileNotFound => {},
+            else => return e,
+        },
         else => return err,
     };
-    try std.Io.Dir.symLink(.cwd(), io, target, link_abs, .{});
+    try std.Io.Dir.symLink(.cwd(), io, target, link_abs, .{ .is_directory = is_directory });
 }
 
 /// Snapshot of the current Zig environment, used by both `zvk status` and the
@@ -716,7 +831,7 @@ pub fn runList(arena: std.mem.Allocator, io: Io, env: *std.process.Environ.Map, 
 
 /// Hardcoded zvk version. Must match `version` in build.zig.zon and used by
 /// `zvk version` and `zvk self-update`.
-pub const zvk_version = "0.0.4";
+pub const zvk_version = "0.0.5";
 
 /// Latest-release API URL for self-update.
 const release_api_url = "https://api.github.com/repos/zoptia/zig-version-kit/releases/latest";
@@ -878,7 +993,7 @@ pub fn runUse(arena: std.mem.Allocator, io: Io, env: *std.process.Environ.Map, a
     const channel_link = try std.fs.path.join(arena, &.{ root, "channels", @tagName(channel) });
     const target = try std.fs.path.join(arena, &.{ "..", "versions", version });
     try std.Io.Dir.createDirPath(.cwd(), io, try std.fs.path.join(arena, &.{ root, "channels" }));
-    try replaceSymlink(io, target, channel_link);
+    try replaceSymlink(io, target, channel_link, true);
     try writeStatusClaudeMd(arena, io, env);
 
     try stdout.print("channel '{s}' -> {s}\n", .{ @tagName(channel), version });
@@ -1199,7 +1314,8 @@ pub fn run(
 
         try stdout.print("[zvk] extracting to {s}\n", .{version_dir});
         try stdout.flush();
-        try extractTarXz(gpa, io, tarball, version_dir, 1);
+        // Format dispatch: Windows Zig is shipped as .zip; everything else .tar.xz.
+        try extractArchive(gpa, io, tarball, version_dir, 1, entry.tarball);
     }
 
     // Channel symlink: <root>/channels/<channel> -> ../versions/<version>
@@ -1207,16 +1323,16 @@ pub fn run(
     try std.Io.Dir.createDirPath(.cwd(), io, channels_dir);
     const channel_link = try std.fs.path.join(arena, &.{ channels_dir, @tagName(channel) });
     const channel_target = try std.fs.path.join(arena, &.{ "..", "versions", entry.version });
-    try replaceSymlink(io, channel_target, channel_link);
+    try replaceSymlink(io, channel_target, channel_link, true);
     try stdout.print("[zvk] channel '{s}' -> {s}\n", .{ @tagName(channel), entry.version });
 
-    // Bin symlink: <root>/bin/{zig|zig-nightly} -> ../channels/<channel>/zig
+    // Bin symlink: <root>/bin/{zig|zig-nightly}[.exe] -> ../channels/<channel>/zig[.exe]
     const bin_dir = try std.fs.path.join(arena, &.{ root, "bin" });
     try std.Io.Dir.createDirPath(.cwd(), io, bin_dir);
     const bin_name = binNameFor(channel);
     const bin_link = try std.fs.path.join(arena, &.{ bin_dir, bin_name });
-    const bin_target = try std.fs.path.join(arena, &.{ "..", "channels", @tagName(channel), "zig" });
-    try replaceSymlink(io, bin_target, bin_link);
+    const bin_target = try std.fs.path.join(arena, &.{ "..", "channels", @tagName(channel), zigBinaryName() });
+    try replaceSymlink(io, bin_target, bin_link, false);
     try stdout.print("[zvk] {s}/{s} ready\n", .{ bin_dir, bin_name });
 
     try setupPath(arena, gpa, io, env, bin_dir, stdout);
@@ -1357,7 +1473,7 @@ fn installZlsForRelease(
     }
 
     const zls_dir = try std.fs.path.join(arena, &.{ root, "zls", asset.version });
-    const zls_bin_path = try std.fs.path.join(arena, &.{ zls_dir, "zls" });
+    const zls_bin_path = try std.fs.path.join(arena, &.{ zls_dir, zlsBinaryName() });
     if (std.Io.Dir.accessAbsolute(io, zls_bin_path, .{})) {
         try stdout.print("[zvk] zls {s} already installed\n", .{asset.version});
     } else |_| {
@@ -1410,14 +1526,14 @@ fn linkZlsBin(
 ) !void {
     const bin_dir = try std.fs.path.join(arena, &.{ root, "bin" });
     try std.Io.Dir.createDirPath(.cwd(), io, bin_dir);
-    const link = try std.fs.path.join(arena, &.{ bin_dir, "zls" });
-    const target = try std.fs.path.join(arena, &.{ "..", "zls", zls_version, "zls" });
-    try replaceSymlink(io, target, link);
+    const bin = zlsBinaryName();
+    const link = try std.fs.path.join(arena, &.{ bin_dir, bin });
+    const target = try std.fs.path.join(arena, &.{ "..", "zls", zls_version, bin });
+    try replaceSymlink(io, target, link, false);
     try stdout.print("[zvk] zls {s} ready ({s})\n", .{ zls_version, link });
 }
 
-/// Extract tar.xz (linux/macos). Windows .zip is not yet supported — we print
-/// a friendly message and return.
+/// zls tarball/zip is flat (binary at the root), so strip_components=0.
 fn extractZlsArchive(
     gpa: std.mem.Allocator,
     io: Io,
@@ -1425,13 +1541,7 @@ fn extractZlsArchive(
     dest_dir_abs: []const u8,
     source_url: []const u8,
 ) !void {
-    if (std.mem.endsWith(u8, source_url, ".zip")) {
-        // TODO: implement zip extraction for Windows zls. For now, callers on
-        // Windows hit this path and we fail loud — install path treats this as
-        // a soft failure and continues.
-        return error.ZipExtractionNotSupported;
-    }
-    try extractTarXz(gpa, io, tarball, dest_dir_abs, 0);
+    try extractArchive(gpa, io, tarball, dest_dir_abs, 0, source_url);
 }
 
 /// `zvk install zls` — explicit zls install for the active release Zig.

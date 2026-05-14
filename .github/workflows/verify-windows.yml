@@ -1,0 +1,63 @@
+name: Verify (Windows)
+
+# Runs install.ps1 end-to-end on a Windows runner and asserts that zvk + zig
+# produce the expected exit codes. Auto-triggers after each release so a bad
+# release surfaces quickly; can also be run manually via workflow_dispatch.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "ZVK_VERSION to install (default: latest)"
+        required: false
+        default: "latest"
+
+jobs:
+  install-and-verify:
+    runs-on: windows-latest
+    steps:
+      - name: Run install.ps1
+        shell: pwsh
+        env:
+          ZVK_VERSION: ${{ github.event.inputs.version || 'latest' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          irm https://raw.githubusercontent.com/zoptia/zig-version-kit/main/install.ps1 | iex
+
+      - name: zvk version + status
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bin = Join-Path $env:USERPROFILE '.zoptia\zig\bin'
+          $env:PATH = "$bin;$env:PATH"
+          & zvk version
+          if ($LASTEXITCODE -ne 0) { throw "zvk version failed ($LASTEXITCODE)" }
+          & zvk status
+          if ($LASTEXITCODE -ne 0) { throw "zvk status failed ($LASTEXITCODE)" }
+
+      - name: zig version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bin = Join-Path $env:USERPROFILE '.zoptia\zig\bin'
+          $env:PATH = "$bin;$env:PATH"
+          & zig version
+          if ($LASTEXITCODE -ne 0) { throw "zig version failed ($LASTEXITCODE)" }
+
+      - name: Confirm expected files
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:USERPROFILE '.zoptia\zig'
+          $expected = @(
+            (Join-Path $root 'bin\zvk.exe'),
+            (Join-Path $root 'CLAUDE.md'),
+            (Join-Path $root 'release\REFERENCE.md'),
+            (Join-Path $root 'claude-plugin\.claude-plugin\marketplace.json')
+          )
+          foreach ($p in $expected) {
+            if (-not (Test-Path $p)) { throw "missing: $p" }
+            Write-Host "ok: $p"
+          }
