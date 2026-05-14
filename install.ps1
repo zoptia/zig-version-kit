@@ -37,6 +37,20 @@ try {
     & $exe self-install
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+    # Idempotently add ~/.zoptia/zig/bin to the user's PATH (User scope, persists
+    # across shells). zvk itself doesn't manage PATH on Windows — see setupPath.
+    $binDir = Join-Path $env:USERPROFILE '.zoptia\zig\bin'
+    $userPath = [Environment]::GetEnvironmentVariable('PATH', 'User')
+    if (-not $userPath -or ($userPath.Split(';') -notcontains $binDir)) {
+        $newPath = if ($userPath) { "$binDir;$userPath" } else { $binDir }
+        [Environment]::SetEnvironmentVariable('PATH', $newPath, 'User')
+        Write-Host "[zvk] added $binDir to user PATH (restart your shell to pick it up)"
+    } else {
+        Write-Host "[zvk] PATH already configured"
+    }
+    # Make the new bin dir visible to the current process so subsequent zvk calls work.
+    $env:PATH = "$binDir;$env:PATH"
+
     & $exe install
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }

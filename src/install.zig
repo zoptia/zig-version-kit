@@ -48,8 +48,15 @@ pub fn currentTarget() []const u8 {
 
 pub fn defaultRoot(allocator: std.mem.Allocator, env: *std.process.Environ.Map) ![]u8 {
     if (env.get("ZVK_ROOT")) |r| return try allocator.dupe(u8, r);
-    const home = env.get("HOME") orelse return error.NoHome;
+    // POSIX uses HOME; Windows uses USERPROFILE. Check both so a single binary
+    // works across platforms without the caller pre-setting HOME.
+    const home = env.get("HOME") orelse env.get("USERPROFILE") orelse return error.NoHome;
     return try std.fs.path.join(allocator, &.{ home, ".zoptia", "zig" });
+}
+
+/// Filename of the zvk executable on the current platform.
+inline fn zvkBinaryName() []const u8 {
+    return if (builtin.os.tag == .windows) "zvk.exe" else "zvk";
 }
 
 /// One resolved entry from index.json — version + platform-specific tarball metadata.
@@ -231,7 +238,7 @@ pub const Status = struct {
 pub fn collectStatus(arena: std.mem.Allocator, io: Io, env: *std.process.Environ.Map) !Status {
     const root = try defaultRoot(arena, env);
     const bin_dir = try std.fs.path.join(arena, &.{ root, "bin" });
-    const zvk_path = try std.fs.path.join(arena, &.{ bin_dir, "zvk" });
+    const zvk_path = try std.fs.path.join(arena, &.{ bin_dir, zvkBinaryName() });
 
     return .{
         .install_root = root,
@@ -709,7 +716,7 @@ pub fn runList(arena: std.mem.Allocator, io: Io, env: *std.process.Environ.Map, 
 
 /// Hardcoded zvk version. Must match `version` in build.zig.zon and used by
 /// `zvk version` and `zvk self-update`.
-pub const zvk_version = "0.0.3";
+pub const zvk_version = "0.0.4";
 
 /// Latest-release API URL for self-update.
 const release_api_url = "https://api.github.com/repos/zoptia/zig-version-kit/releases/latest";
@@ -748,7 +755,7 @@ pub fn runSelfUpdate(
 
     const root = try defaultRoot(arena, env);
     const bin_dir = try std.fs.path.join(arena, &.{ root, "bin" });
-    const target = try std.fs.path.join(arena, &.{ bin_dir, "zvk" });
+    const target = try std.fs.path.join(arena, &.{ bin_dir, zvkBinaryName() });
 
     try stdout.print("[zvk] querying {s}\n", .{release_api_url});
     try stdout.flush();
@@ -829,7 +836,7 @@ pub fn runSelfInstall(
     const current_exe = try std.process.executablePathAlloc(io, arena);
     const root = try defaultRoot(arena, env);
     const bin_dir = try std.fs.path.join(arena, &.{ root, "bin" });
-    const target = try std.fs.path.join(arena, &.{ bin_dir, "zvk" });
+    const target = try std.fs.path.join(arena, &.{ bin_dir, zvkBinaryName() });
 
     if (std.mem.eql(u8, current_exe, target)) {
         try stdout.print("[zvk] already installed at {s}\n", .{target});
@@ -972,6 +979,14 @@ fn setupPath(
     stdout: *Io.Writer,
 ) !void {
     if (env.get("ZVK_NO_MODIFY_PATH")) |_| return;
+
+    // Windows PATH is managed by install.ps1 (via [Environment]::SetEnvironmentVariable
+    // with User scope). Don't try to write POSIX-style export lines into a Unix rc file
+    // that doesn't exist on Windows.
+    if (builtin.os.tag == .windows) {
+        try stdout.print("[zvk] on Windows; PATH should be configured by install.ps1\n", .{});
+        return;
+    }
 
     const home = env.get("HOME") orelse return;
     const shell = env.get("SHELL") orelse {
